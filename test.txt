@@ -14,73 +14,104 @@ settings = get_settings()
 # ── PostgreSQL ─────────────────────────────────────────────────────────────────
 engine = create_engine(settings.db_url)
 
-# ── Azure Blob Storage ─────────────────────────────────────────────────────────
+# ── Azure Blob ─────────────────────────────────────────────────────────────────
 blob_service_client = BlobServiceClient.from_connection_string(
     settings.azure_storage_connection_string
 )
 
-def download_model():
-    """Download model from Azure Blob Storage to local data/models/ on startup."""
-    local_path = os.path.join(ROOT_DIR, "app", "data", "models", "gasleakmodel.cbm")
-    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+# ── Static folder — temporary runtime storage ──────────────────────────────────
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+os.makedirs(STATIC_DIR, exist_ok=True)
 
+MODEL_RUNTIME_PATH = os.path.join(STATIC_DIR, "gasleakmodel.cbm")
+
+
+def download_model():
+    """Pull model from Azure Blob into db/static/ for runtime use."""
     container_client = blob_service_client.get_container_client(
         settings.azure_container_name
     )
     blob_client = container_client.get_blob_client(settings.azure_model_blob_name)
 
-    with open(local_path, "wb") as f:
+    with open(MODEL_RUNTIME_PATH, "wb") as f:
         f.write(blob_client.download_blob().readall())
 
-    print(f"[OK] Model downloaded from Azure Blob → {local_path}")
+    print(f"[OK] Model downloaded → {MODEL_RUNTIME_PATH}")
 
 
 def upload_model():
-    """Upload retrained model back to Azure Blob Storage."""
-    local_path = os.path.join(ROOT_DIR, "app", "data", "models", "gasleakmodel.cbm")
-
+    """Push retrained model from db/static/ back to Azure Blob."""
     container_client = blob_service_client.get_container_client(
         settings.azure_container_name
     )
     blob_client = container_client.get_blob_client(settings.azure_model_blob_name)
 
-    with open(local_path, "rb") as f:
+    with open(MODEL_RUNTIME_PATH, "rb") as f:
         blob_client.upload_blob(f, overwrite=True)
 
-    print(f"[OK] Model uploaded to Azure Blob ← {local_path}")
+    print(f"[OK] Model uploaded ← {MODEL_RUNTIME_PATH}")
 
-step3:
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from api.routes import router
-from app.db.client import download_model
 
-app = FastAPI(title="Gas Leak Agent API")
+# Update config.py
+# ── File paths ──────────────────────────────────────────────────────────────────
+ROOT_DIR     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-@app.on_event("startup")
-async def startup():
-    download_model()
+SKILLS_DIR          = os.path.join(ROOT_DIR, "app", "skills")
+ANALYSIS_HEX_SHP    = os.path.join(SKILLS_DIR, "analysis_map",  "assets", "hexagon_data",  "Singapore_hexagon.shp")
+ANALYSIS_MAP_SHP    = os.path.join(SKILLS_DIR, "analysis_map",  "assets", "mapsheet_data", "Mapsheet.shp")
+RETRAIN_HEX_SHP     = os.path.join(SKILLS_DIR, "retrain_model", "assets", "hexagon_data",  "Singapore_hexagon.shp")
+RETRAIN_MAP_SHP     = os.path.join(SKILLS_DIR, "retrain_model", "assets", "mapsheet_data", "Mapsheet.shp")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Model lives in db/static/ during runtime
+MODEL_PATH  = os.path.join(ROOT_DIR, "app", "db", "static", "gasleakmodel.cbm")
 
-app.include_router(router)
+# routes.py
+from fastapi import APIRouter
+from fastapi.responses import FileResponse, HTMLResponse
+from utils.models import ChatRequest, ChatResponse
+from gasleakagent.agent import run_agent
+import os
 
-step4:
-from app.db.client import upload_model
+router = APIRouter()
 
-def train_and_save(hex_train_df):
-    # ... existing training code ...
-    
-    model.save_model(MODEL_PATH)
-    print(f"  [OK] Model saved to {MODEL_PATH}")
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
 
-    # Upload to Azure Blob
-    upload_model()
-    print(f"  [OK] Model uploaded to Azure Blob Storage")
+@router.post("/chat", response_model=ChatResponse)
+def chat(request: ChatRequest):
+    try:
+        response = run_agent(request.message)
+        return ChatResponse(response=response)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return model
+@router.get("/health")
+def health():
+    return {"status": "ok"}
+
+@router.get("/download/{filename}")
+def download_prediction(filename: str):
+    """Download a prediction CSV."""
+    file_path = os.path.join(ROOT_DIR, "app", "db", "static", filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found.")
+    return FileResponse(
+        path=file_path,
+        filename=filename,
+        media_type="text/csv"
+    )
+
+@router.get("/map/{filename}")
+def view_map(filename: str):
+    """Serve the Folium HTML map for the frontend to display."""
+    file_path = os.path.join(ROOT_DIR, "app", "db", "static", filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Map not found.")
+    with open(file_path, "r") as f:
+        html_content = f.read()
+    return HTMLResponse(content=html_content)
+
+# update config.py
+STATIC_DIR  = os.path.join(ROOT_DIR, "app", "db", "static")
+MODEL_PATH  = os.path.join(STATIC_DIR, "gasleakmodel.cbm")
+OUTPUT_DIR  = os.path.join(STATIC_DIR)   # CSVs saved here for download
+VISUAL_DIR  = os.path.join(STATIC_DIR)   # HTML maps saved here for frontend
