@@ -1,0 +1,86 @@
+import sys
+import os
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+from sqlalchemy import create_engine
+from azure.storage.blob import BlobServiceClient
+from app.core.config import get_settings
+
+settings = get_settings()
+
+# ── PostgreSQL ─────────────────────────────────────────────────────────────────
+engine = create_engine(settings.db_url)
+
+# ── Azure Blob Storage ─────────────────────────────────────────────────────────
+blob_service_client = BlobServiceClient.from_connection_string(
+    settings.azure_storage_connection_string
+)
+
+def download_model():
+    """Download model from Azure Blob Storage to local data/models/ on startup."""
+    local_path = os.path.join(ROOT_DIR, "app", "data", "models", "gasleakmodel.cbm")
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+    container_client = blob_service_client.get_container_client(
+        settings.azure_container_name
+    )
+    blob_client = container_client.get_blob_client(settings.azure_model_blob_name)
+
+    with open(local_path, "wb") as f:
+        f.write(blob_client.download_blob().readall())
+
+    print(f"[OK] Model downloaded from Azure Blob → {local_path}")
+
+
+def upload_model():
+    """Upload retrained model back to Azure Blob Storage."""
+    local_path = os.path.join(ROOT_DIR, "app", "data", "models", "gasleakmodel.cbm")
+
+    container_client = blob_service_client.get_container_client(
+        settings.azure_container_name
+    )
+    blob_client = container_client.get_blob_client(settings.azure_model_blob_name)
+
+    with open(local_path, "rb") as f:
+        blob_client.upload_blob(f, overwrite=True)
+
+    print(f"[OK] Model uploaded to Azure Blob ← {local_path}")
+
+step3:
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from api.routes import router
+from app.db.client import download_model
+
+app = FastAPI(title="Gas Leak Agent API")
+
+@app.on_event("startup")
+async def startup():
+    download_model()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(router)
+
+step4:
+from app.db.client import upload_model
+
+def train_and_save(hex_train_df):
+    # ... existing training code ...
+    
+    model.save_model(MODEL_PATH)
+    print(f"  [OK] Model saved to {MODEL_PATH}")
+
+    # Upload to Azure Blob
+    upload_model()
+    print(f"  [OK] Model uploaded to Azure Blob Storage")
+
+    return model
